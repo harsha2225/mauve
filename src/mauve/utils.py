@@ -22,20 +22,21 @@ def get_device_from_arg(device_id):
     else:
         return CPU_DEVICE
 
+def _is_encoder_model(model):
+    """Returns True for encoder-only models (BERT, RoBERTa, DeBERTa, MiniLM, etc.).
+    Uses the config flag rather than a hardcoded model-type list so any encoder architecture works."""
+    return not getattr(model.config, 'is_decoder', False)
+
 def get_model(model_name, tokenizer, device_id):
     device = get_device_from_arg(device_id)
-    if 'gpt2' in model_name or "bert" in model_name:
-        model = AutoModel.from_pretrained(model_name, pad_token_id=tokenizer.eos_token_id).to(device)
-        model = model.eval()
-    else:
-        raise ValueError(f'Unknown model: {model_name}')
+    pad_token_id = getattr(tokenizer, 'eos_token_id', None) or getattr(tokenizer, 'pad_token_id', None)
+    kwargs = {'pad_token_id': pad_token_id} if pad_token_id is not None else {}
+    model = AutoModel.from_pretrained(model_name, **kwargs).to(device)
+    model = model.eval()
     return model
 
 def get_tokenizer(model_name='gpt2'):
-    if 'gpt2' in model_name or "bert" in model_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    else:
-        raise ValueError(f'Unknown model: {model_name}')
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     return tokenizer
 
 def load_json_dataset(data_path, max_num_data):
@@ -97,8 +98,13 @@ def featurize_tokens_from_model(model, tokenized_texts, batch_size, name="", ver
     feats, chunks, chunk_sent_lengths = [], [], []
     chunk_idx = 0
 
+    _max_pos = getattr(model.config, 'max_position_embeddings', None)
+    _encoder = _is_encoder_model(model)
+
     while chunk_idx * batch_size < len(tokenized_texts):
         _chunk = [_t.view(-1) for _t in tokenized_texts[chunk_idx * batch_size: (chunk_idx + 1) * batch_size]]
+        if _max_pos is not None:
+            _chunk = [_t[:_max_pos] for _t in _chunk]
         chunks.append(_chunk)
         chunk_sent_lengths.append([len(_c) for _c in _chunk])
         chunk_idx += 1
@@ -111,14 +117,22 @@ def featurize_tokens_from_model(model, tokenized_texts, batch_size, name="", ver
             [torch.ones(sent_length).long() for sent_length in chunk_sent_length],
             batch_first=True,
             padding_value=0).to(device)
-        outs = model(input_ids=padded_chunk,
-                     attention_mask=attention_mask,
-                     past_key_values=None,
-                     output_hidden_states=True,
-                     return_dict=True)
+        model_kwargs = dict(input_ids=padded_chunk,
+                            attention_mask=attention_mask,
+                            output_hidden_states=True,
+                            return_dict=True)
+        if not _encoder:
+            model_kwargs['past_key_values'] = None
+        outs = model(**model_kwargs)
         h = []
-        for hidden_state, sent_length in zip(outs.hidden_states[-1], chunk_sent_length):
-            h.append(hidden_state[sent_length - 1])
+        if _encoder:
+            # mean pooling over non-padded tokens
+            for hidden_state, sent_length in zip(outs.hidden_states[-1], chunk_sent_length):
+                h.append(hidden_state[:sent_length].mean(dim=0))
+        else:
+            # decoder models: last token embedding
+            for hidden_state, sent_length in zip(outs.hidden_states[-1], chunk_sent_length):
+                h.append(hidden_state[sent_length - 1])
         h = torch.stack(h, dim=0)
         feats.append(h.cpu())
     t2 = time.time()
